@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python Environment Files
+.python-version
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary Files
+*.tmp
+
+# Build Files
+build/
+dist/
+*.egg-info/
+
+# Model Cache
+nltk_data/
+
+# Streamlit (for future UI)
+.streamlit/secrets.toml
+
+# Environment Variables
+.env
+
+# Pytest
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Ignore large model checkpoints (optional)
+*.h5
+*.pt
+*.pth
+*.ckpt
