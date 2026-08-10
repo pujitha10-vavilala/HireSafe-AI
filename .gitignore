@@ -59,4 +59,4 @@ htmlcov/
 *.h5
 *.pt
 *.pth
-*.ckpt
+*.ckpthiresafe.db
