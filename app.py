@@ -193,6 +193,21 @@ def get_user_analyses(user_id):
 init_database()
 
 # ============================================================
+# RESULT HELPERS
+# ============================================================
+
+FAKE_KEYWORDS = [
+    "urgent", "easy money", "registration fee", "work from home",
+    "investment", "click here", "guaranteed", "quick cash",
+    "limited seats", "earn daily"
+]
+
+def get_suspicious_keywords(title, description):
+    text = f"{title} {description}".lower()
+    return [word for word in FAKE_KEYWORDS if word in text]
+
+
+# ============================================================
 # PAGE CONFIG
 # ============================================================
 
@@ -882,6 +897,7 @@ if st.session_state.page == "Analyze":
             st.session_state.decision_score = decision_score
             st.session_state.last_company = company_name
             st.session_state.last_job_title = job_title
+            st.session_state.last_job_description = job_description
 
             # Save this analysis permanently for the signed-in user.
             if st.session_state.logged_in and st.session_state.user_id:
@@ -905,75 +921,59 @@ elif st.session_state.page == "Result":
 
     prediction = st.session_state.prediction
     confidence = st.session_state.confidence
+    job_title = st.session_state.get("last_job_title", "Job Posting")
+    job_description = st.session_state.get("last_job_description", "")
+    suspicious_words = get_suspicious_keywords(job_title, job_description)
 
-    render_html(
-        f"""
-        <div style="
-            text-align:center;
-            padding:65px 20px 35px 20px;
-        ">
-            <div style="font-size:60px;">
-                {"🟢" if prediction == 0 else "🔴"}
-            </div>
-
-            <div style="
-                font-size:42px;
-                font-weight:900;
-                color:{TEXT};
-                margin-top:15px;
-            ">
-                {"Likely Legitimate" if prediction == 0 else "Potentially Fraudulent"}
-            </div>
-
-            <div style="
-                margin-top:12px;
-                font-size:17px;
-                color:{MUTED};
-            ">
-                HireSafe AI assessment
-            </div>
+    render_html(f"""<div style="text-align:center;padding:55px 20px 30px 20px;">
+        <div style="font-size:58px;">{"🟢" if prediction == 0 else "🔴"}</div>
+        <div style="font-size:40px;font-weight:900;color:{TEXT};margin-top:12px;">
+            {"Likely Legitimate" if prediction == 0 else "Potentially Fraudulent"}
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        <div style="color:{MUTED};font-size:16px;margin-top:10px;">HireSafe AI assessment for <b>{job_title}</b></div>
+    </div>""", unsafe_allow_html=True)
 
-    r1, r2, r3 = st.columns(3)
-
-    with r1:
-        st.metric("AI Confidence", f"{confidence:.1f}%")
-
-    with r2:
-        st.metric(
-            "Risk Level",
-            "Lower Risk" if prediction == 0 else "Higher Risk"
-        )
-
-    with r3:
-        st.metric(
-            "Result",
-            "Legitimate" if prediction == 0 else "Fraudulent"
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
+    r1,r2,r3=st.columns(3)
+    with r1: st.metric("AI Confidence",f"{confidence:.1f}%")
+    with r2: st.metric("Risk Level","Lower Risk" if prediction == 0 else "Higher Risk")
+    with r3: st.metric("Result","Legitimate" if prediction == 0 else "Fraudulent")
 
     if prediction == 0:
-        st.success(
-            "This posting matches patterns the model has learned from legitimate job postings. "
-            "Still verify the employer before sharing personal information."
-        )
+        why="✓ No major suspicious indicators were detected.<br>✓ The posting matches patterns commonly found in legitimate jobs.<br>✓ The overall information provided appears reasonably consistent."
+        tips=["Verify the employer's official website.","Avoid sharing sensitive information too early.","Confirm the recruiter uses an official company email."]
     else:
-        st.error(
-            "This posting contains patterns associated with fraudulent job postings. "
-            "Verify the employer carefully before proceeding."
-        )
+        why="⚠ Suspicious patterns were detected in this job posting.<br>⚠ The posting contains characteristics associated with fraudulent jobs.<br>⚠ Consider verifying the employer before proceeding."
+        tips=["Verify the company's official website.","Never pay registration or recruitment fees.","Check company reviews before applying.","Contact the recruiter through official channels."]
 
-    if st.button("← Analyze Another Job"):
-        st.session_state.page = "Analyze"
-        st.rerun()
+    render_html(f"""<div style="background:{CARD};border:1px solid {BORDER};border-radius:18px;padding:24px;margin:25px 0 18px;">
+        <div style="font-size:22px;font-weight:800;color:{TEXT};margin-bottom:12px;">🔍 Why this result?</div>
+        <div style="color:{MUTED};line-height:2;font-size:15px;">{why}</div>
+    </div>""",unsafe_allow_html=True)
+
+    left,right=st.columns(2)
+    with left:
+        tips_html="".join(f"<div style='margin:9px 0;'>✓ {tip}</div>" for tip in tips)
+        render_html(f"""<div style="background:{CARD};border:1px solid {BORDER};border-radius:18px;padding:24px;min-height:190px;">
+            <div style="font-size:21px;font-weight:800;color:{TEXT};margin-bottom:12px;">🛡️ Safety Tips</div>
+            <div style="color:{MUTED};line-height:1.7;font-size:14px;">{tips_html}</div>
+        </div>""",unsafe_allow_html=True)
+
+    with right:
+        keyword_html=("".join(f"<div style='margin:9px 0;'>⚠️ {word}</div>" for word in suspicious_words)
+            if suspicious_words else "<div style='margin-top:10px;'>No suspicious keywords detected.</div>")
+        render_html(f"""<div style="background:{CARD};border:1px solid {BORDER};border-radius:18px;padding:24px;min-height:190px;">
+            <div style="font-size:21px;font-weight:800;color:{TEXT};margin-bottom:12px;">🚨 Suspicious Keywords</div>
+            <div style="color:{MUTED};line-height:1.7;font-size:14px;">{keyword_html}</div>
+        </div>""",unsafe_allow_html=True)
+
+    st.markdown("<br>",unsafe_allow_html=True)
+    c1,c2,c3=st.columns([1,2,1])
+    with c2:
+        if st.button("← Analyze Another Job",use_container_width=True,key="analyze_another_job"):
+            st.session_state.page="Analyze"
+            st.rerun()
 
 
-
-# ============================================================
 # DASHBOARD PAGE
 # ============================================================
 
