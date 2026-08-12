@@ -4,6 +4,8 @@ import joblib
 import numpy as np
 from scipy.sparse import hstack
 from datetime import datetime
+import os
+import psycopg2
 import sqlite3
 import hashlib
 import secrets
@@ -27,175 +29,279 @@ def render_html(html, **kwargs):
 # DATABASE
 # ============================================================
 
-DB_NAME = "hiresafe.db"
+# Render provides DATABASE_URL through Environment Variables.
+# Locally, when DATABASE_URL is absent, the app uses SQLite.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def using_postgres():
+    return bool(DATABASE_URL)
 
 
 def get_db():
-    return sqlite3.connect(DB_NAME)
+    """
+    PostgreSQL on Render.
+    SQLite locally in VS Code when DATABASE_URL is not configured.
+    """
+    if using_postgres():
+        return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+    conn = sqlite3.connect("hiresafe.db")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def init_database():
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+    if using_postgres():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS analyses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            company TEXT NOT NULL,
-            job_title TEXT NOT NULL,
-            result TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            analyzed_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                company TEXT NOT NULL,
+                job_title TEXT NOT NULL,
+                result TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL,
+                analyzed_at TEXT NOT NULL,
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+    else:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                company TEXT NOT NULL,
+                job_title TEXT NOT NULL,
+                result TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                analyzed_at TEXT NOT NULL,
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
 
     conn.commit()
+    cursor.close()
     conn.close()
 
 
 def hash_password(password):
+    """Create a salted password hash."""
     salt = secrets.token_hex(16)
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        100000
-    ).hex()
-
+    password_hash = hashlib.sha256(
+        (salt + password).encode("utf-8")
+    ).hexdigest()
     return f"{salt}${password_hash}"
 
 
-def verify_password(password, stored_password):
+def verify_password(password, stored_hash):
+    """Verify a password against a stored salted hash."""
     try:
-        salt, stored_hash = stored_password.split("$", 1)
-
-        password_hash = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt.encode("utf-8"),
-            100000
-        ).hex()
-
-        return secrets.compare_digest(password_hash, stored_hash)
-
+        salt, expected_hash = stored_hash.split("$", 1)
     except ValueError:
         return False
 
+    actual_hash = hashlib.sha256(
+        (salt + password).encode("utf-8")
+    ).hexdigest()
+
+    return secrets.compare_digest(actual_hash, expected_hash)
+
 
 def create_user(name, email, password):
+    """Create a user and return (user_id, error_message)."""
     conn = get_db()
+    cursor = conn.cursor()
+
+    name = name.strip()
+    email = email.strip().lower()
 
     try:
-        cursor = conn.cursor()
+        password_hash = hash_password(password)
+        created_at = datetime.now().isoformat(timespec="seconds")
 
-        cursor.execute(
-            """
-            INSERT INTO users
-            (name, email, password_hash, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                name.strip(),
-                email.strip().lower(),
-                hash_password(password),
-                datetime.now().isoformat(timespec="seconds")
+        if using_postgres():
+            cursor.execute(
+                """
+                INSERT INTO users (name, email, password_hash, created_at)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (name, email, password_hash, created_at)
             )
-        )
+            user_id = cursor.fetchone()[0]
+
+        else:
+            cursor.execute(
+                """
+                INSERT INTO users (name, email, password_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, email, password_hash, created_at)
+            )
+            user_id = cursor.lastrowid
 
         conn.commit()
-        user_id = cursor.lastrowid
         return user_id, None
 
-    except sqlite3.IntegrityError:
-        return None, "An account with this email already exists."
+    except Exception as e:
+        conn.rollback()
+
+        # Avoid exposing database details to the user.
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            return None, "An account with this email already exists."
+
+        return None, "Could not create the account. Please try again."
 
     finally:
+        cursor.close()
         conn.close()
 
 
 def authenticate_user(email, password):
+    """Return the user as a dictionary when credentials are valid."""
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT id, name, email, password_hash
-        FROM users
-        WHERE email = ?
-        """,
-        (email.strip().lower(),)
-    )
+    email = email.strip().lower()
 
-    user = cursor.fetchone()
-    conn.close()
+    try:
+        placeholder = "%s" if using_postgres() else "?"
 
-    if user and verify_password(password, user[3]):
+        cursor.execute(
+            f"""
+            SELECT id, name, email, password_hash
+            FROM users
+            WHERE email = {placeholder}
+            """,
+            (email,)
+        )
+
+        row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        user_id, name, stored_email, stored_hash = row
+
+        if not verify_password(password, stored_hash):
+            return None
+
         return {
-            "id": user[0],
-            "name": user[1],
-            "email": user[2]
+            "id": user_id,
+            "name": name,
+            "email": stored_email
         }
 
-    return None
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def save_analysis(user_id, company, job_title, result, confidence):
+    """Save a completed job analysis for the signed-in user."""
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        INSERT INTO analyses
-        (user_id, company, job_title, result, confidence, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            company.strip() or "Company not provided",
-            job_title.strip(),
-            result,
-            float(confidence),
-            datetime.now().isoformat(timespec="seconds")
-        )
-    )
+    try:
+        analyzed_at = datetime.now().isoformat(timespec="seconds")
 
-    conn.commit()
-    conn.close()
+        if using_postgres():
+            cursor.execute(
+                """
+                INSERT INTO analyses
+                    (user_id, company, job_title, result, confidence, analyzed_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    user_id,
+                    company.strip(),
+                    job_title.strip(),
+                    result,
+                    float(confidence),
+                    analyzed_at
+                )
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO analyses
+                    (user_id, company, job_title, result, confidence, analyzed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    company.strip(),
+                    job_title.strip(),
+                    result,
+                    float(confidence),
+                    analyzed_at
+                )
+            )
+
+        conn.commit()
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def get_user_analyses(user_id):
+    """Return the user's saved analyses, newest first."""
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        SELECT company, job_title, result, confidence, analyzed_at
-        FROM analyses
-        WHERE user_id = ?
-        ORDER BY id DESC
-        """,
-        (user_id,)
-    )
+    try:
+        placeholder = "%s" if using_postgres() else "?"
 
-    rows = cursor.fetchall()
-    conn.close()
+        cursor.execute(
+            f"""
+            SELECT company, job_title, result, confidence, analyzed_at
+            FROM analyses
+            WHERE user_id = {placeholder}
+            ORDER BY id DESC
+            """,
+            (user_id,)
+        )
 
-    return rows
+        return cursor.fetchall()
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
+# Initialize the database when the application starts.
 init_database()
+
+
 
 # ============================================================
 # RESULT HELPERS
