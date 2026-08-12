@@ -7,6 +7,11 @@ from datetime import datetime
 import sqlite3
 import hashlib
 import secrets
+import re
+import string
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
 
 def render_html(html, **kwargs):
     """Render HTML without displaying the HTML source code."""
@@ -196,15 +201,64 @@ init_database()
 # RESULT HELPERS
 # ============================================================
 
-FAKE_KEYWORDS = [
-    "urgent", "easy money", "registration fee", "work from home",
-    "investment", "click here", "guaranteed", "quick cash",
-    "limited seats", "earn daily"
+# Keep the same suspicious-keyword list used during model training.
+SUSPICIOUS_KEYWORDS = [
+    "urgent",
+    "immediate",
+    "quick",
+    "easy",
+    "earn",
+    "income",
+    "bonus",
+    "limited",
+    "guaranteed",
+    "apply now",
+    "work from home",
+    "no experience",
+    "investment",
+    "payment",
+    "registration fee",
+    "click"
 ]
+
+# IMPORTANT: this preprocessing matches main.py exactly.
+try:
+    STOP_WORDS = set(stopwords.words("english"))
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+    STOP_WORDS = set(stopwords.words("english"))
+
+try:
+    LEMMATIZER = WordNetLemmatizer()
+    LEMMATIZER.lemmatize("test")
+except LookupError:
+    nltk.download("wordnet", quiet=True)
+    nltk.download("omw-1.4", quiet=True)
+    LEMMATIZER = WordNetLemmatizer()
+
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"<.*?>", " ", text)
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"\S+@\S+", " ", text)
+    text = re.sub(r"\+?\d[\d\s-]{8,}\d", " ", text)
+    text = re.sub(r"\d+", " ", text)
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    text = re.sub(r"\s+", " ", text).strip()
+
+    words = []
+    for word in text.split():
+        if word not in STOP_WORDS:
+            words.append(LEMMATIZER.lemmatize(word))
+    return " ".join(words)
+
+def keyword_score(text):
+    text = str(text).lower()
+    return sum(1 for word in SUSPICIOUS_KEYWORDS if word in text)
 
 def get_suspicious_keywords(title, description):
     text = f"{title} {description}".lower()
-    return [word for word in FAKE_KEYWORDS if word in text]
+    return [word for word in SUSPICIOUS_KEYWORDS if word in text]
 
 
 # ============================================================
@@ -850,38 +904,47 @@ if st.session_state.page == "Analyze":
         if not job_title.strip() or not job_description.strip():
             st.warning("Please enter at least the Job Title and Job Description.")
         else:
-            # The saved vectorizer was trained on combined job text.
+            # IMPORTANT: Reproduce the exact feature pipeline used during training.
+            # The training data uses: title + company_profile + description +
+            # requirements + benefits. Location is NOT part of the trained text.
+            title_clean = clean_text(job_title)
+            company_profile_clean = clean_text(company_name)
+            description_clean = clean_text(job_description)
+            requirements_clean = clean_text(requirements)
+            benefits_clean = clean_text(benefits)
+
             combined_text = " ".join([
-                job_title,
-                company_name,
-                location,
-                job_description,
-                requirements,
-                benefits
-            ]).lower()
+                title_clean,
+                company_profile_clean,
+                description_clean,
+                requirements_clean,
+                benefits_clean
+            ])
 
             text_vector = tfidf_vectorizer.transform([combined_text])
 
-            # The saved Linear SVM expects 10,011 features:
-            # 10,000 TF-IDF features + 11 engineered numeric features.
-            description_length = len(job_description)
-            company_profile_length = len(company_name)
-            requirements_length = len(requirements)
-            benefits_length = len(benefits)
-            title_length = len(job_title)
+            # EXACTLY the same 11 engineered features used in main.py.
+            description_length = len(description_clean)
+            company_profile_length = len(company_profile_clean)
+            requirements_length = len(requirements_clean)
+            benefits_length = len(benefits_clean)
+            suspicious_keyword_score = keyword_score(description_clean)
+            missing_company_profile = int(company_profile_clean == "")
+            missing_requirements = int(requirements_clean == "")
+            missing_benefits = int(benefits_clean == "")
 
             numeric_features = np.array([[
                 description_length,
                 company_profile_length,
                 requirements_length,
                 benefits_length,
+                suspicious_keyword_score,
+                missing_company_profile,
+                missing_requirements,
+                missing_benefits,
                 int(telecommuting),
                 int(has_company_logo),
-                int(has_questions),
-                int(description_length == 0),
-                int(company_profile_length == 0),
-                int(requirements_length == 0),
-                title_length
+                int(has_questions)
             ]], dtype=float)
 
             X_new = hstack([text_vector, numeric_features])
@@ -898,6 +961,10 @@ if st.session_state.page == "Analyze":
             st.session_state.last_company = company_name
             st.session_state.last_job_title = job_title
             st.session_state.last_job_description = job_description
+            st.session_state.suspicious_words = get_suspicious_keywords(
+                job_title, job_description
+            )
+            st.session_state.keyword_score = suspicious_keyword_score
 
             # Save this analysis permanently for the signed-in user.
             if st.session_state.logged_in and st.session_state.user_id:
@@ -923,7 +990,11 @@ elif st.session_state.page == "Result":
     confidence = st.session_state.confidence
     job_title = st.session_state.get("last_job_title", "Job Posting")
     job_description = st.session_state.get("last_job_description", "")
-    suspicious_words = get_suspicious_keywords(job_title, job_description)
+    suspicious_words = st.session_state.get(
+        "suspicious_words",
+        get_suspicious_keywords(job_title, job_description)
+    )
+    keyword_score_value = st.session_state.get("keyword_score", len(suspicious_words))
 
     render_html(f"""<div style="text-align:center;padding:55px 20px 30px 20px;">
         <div style="font-size:58px;">{"🟢" if prediction == 0 else "🔴"}</div>
@@ -939,10 +1010,20 @@ elif st.session_state.page == "Result":
     with r3: st.metric("Result","Legitimate" if prediction == 0 else "Fraudulent")
 
     if prediction == 0:
-        why="✓ No major suspicious indicators were detected.<br>✓ The posting matches patterns commonly found in legitimate jobs.<br>✓ The overall information provided appears reasonably consistent."
+        why = (
+            "✓ No major suspicious indicators were detected.<br>"
+            f"✓ {keyword_score_value} suspicious keyword indicator(s) were found.<br>"
+            "✓ The posting matches patterns commonly found in legitimate jobs.<br>"
+            "✓ The overall information provided appears reasonably consistent."
+        )
         tips=["Verify the employer's official website.","Avoid sharing sensitive information too early.","Confirm the recruiter uses an official company email."]
     else:
-        why="⚠ Suspicious patterns were detected in this job posting.<br>⚠ The posting contains characteristics associated with fraudulent jobs.<br>⚠ Consider verifying the employer before proceeding."
+        why = (
+            "⚠ Suspicious patterns were detected in this job posting.<br>"
+            f"⚠ {keyword_score_value} suspicious keyword indicator(s) were found.<br>"
+            "⚠ The posting contains characteristics associated with fraudulent jobs.<br>"
+            "⚠ Consider verifying the employer before proceeding."
+        )
         tips=["Verify the company's official website.","Never pay registration or recruitment fees.","Check company reviews before applying.","Contact the recruiter through official channels."]
 
     render_html(f"""<div style="background:{CARD};border:1px solid {BORDER};border-radius:18px;padding:24px;margin:25px 0 18px;">
